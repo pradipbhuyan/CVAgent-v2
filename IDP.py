@@ -2612,13 +2612,11 @@ with left_col:
 
     if st.button("Submit Background Job", use_container_width=True, disabled=process_disabled, key="submit_bg_job_btn"):
         submit_background_batch_job(uploaded_files)
-
-    if st.button("Process Batch", use_container_width=True, disabled=process_disabled):
-
+    
     if st.button("Process Batch", use_container_width=True, disabled=process_disabled):
         if uploaded_files and len(uploaded_files) > MAX_BATCH_FILES:
             st.error(f"Direct processing is limited to {MAX_BATCH_FILES} files. Use 'Submit Background Job' for large batches.")
-        else:    
+        else:
             if current_batch_signature and current_batch_signature == last_batch_signature:
                 st.session_state.show_reprocess_confirm = True
                 st.session_state.pending_batch_signature = current_batch_signature
@@ -2705,7 +2703,7 @@ with left_col:
                         st.session_state.batch_completed_at - st.session_state.batch_started_at
                     )
                     st.success("Batch processing completed")
-
+    
     if st.session_state.get("show_reprocess_confirm"):
         st.warning("This same batch was already processed. Do you want to re-process it again?")
 
