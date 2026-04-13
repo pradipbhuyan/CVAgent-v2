@@ -8,6 +8,8 @@ import time
 import zipfile
 import tempfile
 import hashlib
+import threading
+import os
 from io import BytesIO
 from pathlib import Path
 from copy import deepcopy
@@ -204,6 +206,20 @@ DEFAULT_KEYS = {
     "jd_rankings": [],
     "detailed_assessment_data": None,
     "detailed_assessment_pdf": None,
+    "job_running": False,
+    "job_status": "Idle",
+    "job_progress": 0,
+    "job_total_files": 0,
+    "job_processed_files": 0,
+    "job_current_file": None,
+    "job_results": [],
+    "job_exception_queue": [],
+    "job_output_zip": None,
+    "job_output_zip_name": None,
+    "job_assessment_pdf": None,
+    "job_rankings": [],
+    "job_notifications": [],
+    "job_thread_started": False,
 }
 for key, value in DEFAULT_KEYS.items():
     if key not in st.session_state:
@@ -303,6 +319,20 @@ def reset_single_file_state():
     st.session_state["progress_value"] = 0
     st.session_state["agent_timings"] = {}
     st.session_state["active_agent"] = None
+
+def reset_background_job_state():
+    st.session_state["job_running"] = False
+    st.session_state["job_status"] = "Idle"
+    st.session_state["job_progress"] = 0
+    st.session_state["job_total_files"] = 0
+    st.session_state["job_processed_files"] = 0
+    st.session_state["job_current_file"] = None
+    st.session_state["job_results"] = []
+    st.session_state["job_exception_queue"] = []
+    st.session_state["job_output_zip"] = None
+    st.session_state["job_output_zip_name"] = None
+    st.session_state["job_assessment_pdf"] = None
+    st.session_state["job_rankings"] = []
 
 def save_temp_file(uploaded_file):
     suffix = Path(uploaded_file.name).suffix
@@ -1097,6 +1127,25 @@ def build_zip_from_batch_results(target_type: str) -> bytes:
     output.seek(0)
     return output.getvalue()
 
+def build_zip_from_results(results, target_type: str) -> bytes:
+    output = BytesIO()
+
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as zf:
+        for item in results:
+            auto_result = item.get("auto_result") or {}
+            result = auto_result.get("result") or {}
+            doc_type = item.get("doc_type")
+
+            if target_type == "resume" and doc_type == "resume":
+                file_bytes = result.get("file")
+                file_name = result.get("file_name") or f"{item.get('file_name', 'resume')}.docx"
+                if file_bytes:
+                    if not file_name.lower().endswith(".docx"):
+                        file_name = f"{file_name}.docx"
+                    zf.writestr(file_name, file_bytes)
+
+    output.seek(0)
+    return output.getvalue()
 
 def get_batch_download_counts():
     resume_count = 0
@@ -1144,6 +1193,24 @@ def rank_all_resumes_against_jd():
 
     st.session_state.jd_rankings = rankings
 
+def rank_resumes_against_jd_for_results(batch_results, jd_text):
+    resume_items = [
+        item for item in batch_results
+        if item.get("doc_type") == "resume" and item.get("review_data")
+    ]
+
+    rankings = []
+    for item in resume_items:
+        resume_data = item.get("review_data") or {}
+        score = score_resume_against_jd(resume_data, jd_text)
+        score["file_name"] = item.get("file_name")
+        rankings.append(score)
+
+    rankings = sorted(rankings, key=lambda x: x.get("overall_score", 0), reverse=True)
+    for idx, row in enumerate(rankings, start=1):
+        row["rank"] = idx
+
+    return rankings
 
 def compact_field(label, value):
     st.markdown(
@@ -1151,6 +1218,238 @@ def compact_field(label, value):
         unsafe_allow_html=True
     )
 
+def run_background_batch_job(uploaded_files, jd_text):
+    try:
+        st.session_state["job_running"] = True
+        st.session_state["job_status"] = "Running"
+        st.session_state["job_progress"] = 0
+        st.session_state["job_total_files"] = len(uploaded_files)
+        st.session_state["job_processed_files"] = 0
+        st.session_state["job_current_file"] = None
+        st.session_state["job_results"] = []
+        st.session_state["job_exception_queue"] = []
+        st.session_state["job_output_zip"] = None
+        st.session_state["job_output_zip_name"] = None
+        st.session_state["job_assessment_pdf"] = None
+        st.session_state["job_rankings"] = []
+
+        temp_original_batch_results = deepcopy(st.session_state.get("batch_results", []))
+        temp_original_exception_queue = deepcopy(st.session_state.get("exception_queue", []))
+        temp_original_active_index = st.session_state.get("active_batch_index", 0)
+        temp_original_review_data = deepcopy(st.session_state.get("review_data"))
+        temp_original_confidence_map = deepcopy(st.session_state.get("confidence_map"))
+        temp_original_validation_result = deepcopy(st.session_state.get("validation_result"))
+        temp_original_duplicate_info = deepcopy(st.session_state.get("duplicate_info"))
+        temp_original_vectorstore = st.session_state.get("vectorstore")
+        temp_original_chat_history = deepcopy(st.session_state.get("chat_history", []))
+        temp_original_suggested_questions = deepcopy(st.session_state.get("suggested_questions", []))
+        temp_original_current_file = st.session_state.get("current_file")
+        temp_original_doc_type = st.session_state.get("doc_type")
+        temp_original_full_text = st.session_state.get("full_text")
+        temp_original_auto_result = deepcopy(st.session_state.get("auto_result"))
+        temp_original_generated_resume = st.session_state.get("generated_resume")
+
+        local_results = []
+        local_exceptions = []
+
+        for idx, uploaded_file in enumerate(uploaded_files, start=1):
+            st.session_state["job_current_file"] = uploaded_file.name
+            st.session_state["job_status"] = f"Processing {uploaded_file.name}"
+            st.session_state["job_progress"] = int(((idx - 1) / max(len(uploaded_files), 1)) * 100)
+
+            try:
+                result = process_single_file(uploaded_file)
+                local_results.append(result)
+
+                if result.get("status") == "Exception":
+                    local_exceptions.append(result)
+
+            except Exception as e:
+                error_result = {
+                    "file_name": uploaded_file.name,
+                    "status": "Exception",
+                    "doc_type": "unknown",
+                    "ocr_used": False,
+                    "exception_reason": f"Unhandled error: {str(e)}",
+                    "cost": 0.0,
+                    "tokens": 0,
+                    "duplicate_info": {
+                        "is_duplicate": False,
+                        "match_file": None,
+                        "reason": None,
+                        "score": 0.0,
+                    },
+                }
+                local_results.append(error_result)
+                local_exceptions.append(error_result)
+
+            st.session_state["job_processed_files"] = idx
+            st.session_state["job_progress"] = int((idx / max(len(uploaded_files), 1)) * 100)
+
+        st.session_state["job_results"] = local_results
+        st.session_state["job_exception_queue"] = local_exceptions
+
+        rankings = rank_resumes_against_jd_for_results(local_results, jd_text)
+        st.session_state["job_rankings"] = rankings
+
+        if rankings:
+            report_data = generate_consolidated_assessment_data(
+                batch_results=local_results,
+                jd_text=jd_text,
+                jd_rankings=rankings
+            )
+            pdf_bytes = build_consolidated_assessment_pdf(report_data)
+            st.session_state["job_assessment_pdf"] = pdf_bytes
+
+        resume_zip = build_zip_from_results(local_results, "resume")
+        st.session_state["job_output_zip"] = resume_zip
+        st.session_state["job_output_zip_name"] = "background_job_resumes.zip"
+
+        st.session_state["job_status"] = "Completed"
+        st.session_state["job_progress"] = 100
+        st.session_state["job_current_file"] = None
+        st.session_state["job_notifications"].append(
+            f"Background batch completed successfully. Processed {len(local_results)} file(s)."
+        )
+
+        st.session_state["batch_results"] = temp_original_batch_results
+        st.session_state["exception_queue"] = temp_original_exception_queue
+        st.session_state["active_batch_index"] = temp_original_active_index
+        st.session_state["review_data"] = temp_original_review_data
+        st.session_state["confidence_map"] = temp_original_confidence_map
+        st.session_state["validation_result"] = temp_original_validation_result
+        st.session_state["duplicate_info"] = temp_original_duplicate_info
+        st.session_state["vectorstore"] = temp_original_vectorstore
+        st.session_state["chat_history"] = temp_original_chat_history
+        st.session_state["suggested_questions"] = temp_original_suggested_questions
+        st.session_state["current_file"] = temp_original_current_file
+        st.session_state["doc_type"] = temp_original_doc_type
+        st.session_state["full_text"] = temp_original_full_text
+        st.session_state["auto_result"] = temp_original_auto_result
+        st.session_state["generated_resume"] = temp_original_generated_resume
+
+    except Exception as e:
+        st.session_state["job_status"] = f"Failed: {str(e)}"
+        st.session_state["job_notifications"].append(
+            f"Background batch failed: {str(e)}"
+        )
+    finally:
+        st.session_state["job_running"] = False
+
+
+def submit_background_batch_job(uploaded_files):
+    jd_text = (st.session_state.get("jd_text") or "").strip()
+
+    if not jd_text:
+        st.warning("Background batch job cannot start because JD is missing.")
+        return
+
+    if not uploaded_files:
+        st.warning("No CV files available for background job.")
+        return
+
+    if st.session_state.get("job_running"):
+        st.warning("A background batch job is already running.")
+        return
+
+    thread = threading.Thread(
+        target=run_background_batch_job,
+        args=(uploaded_files, jd_text),
+        daemon=True,
+    )
+    thread.start()
+    st.session_state["job_thread_started"] = True
+    st.success("Background batch job started.")
+
+
+def render_job_notifications():
+    notifications = st.session_state.get("job_notifications", [])
+    if notifications:
+        latest = notifications[-1]
+        try:
+            st.toast(latest)
+        except Exception:
+            st.success(latest)
+
+
+def render_background_job_monitor():
+    st.markdown("### Background Batch Job")
+
+    job_running = st.session_state.get("job_running", False)
+    job_status = st.session_state.get("job_status", "Idle")
+    job_progress = st.session_state.get("job_progress", 0)
+    job_total_files = st.session_state.get("job_total_files", 0)
+    job_processed_files = st.session_state.get("job_processed_files", 0)
+    job_current_file = st.session_state.get("job_current_file")
+    job_results = st.session_state.get("job_results", [])
+    job_exceptions = st.session_state.get("job_exception_queue", [])
+    job_zip = st.session_state.get("job_output_zip")
+    job_zip_name = st.session_state.get("job_output_zip_name")
+    job_pdf = st.session_state.get("job_assessment_pdf")
+    job_rankings = st.session_state.get("job_rankings", [])
+
+    if job_running:
+        st.info("Background batch is running.")
+    else:
+        st.caption("No active background batch job.")
+
+    st.markdown(f"**Status:** {job_status}")
+    st.markdown(f"**Processed:** {job_processed_files} / {job_total_files}")
+    st.markdown(f"**Current File:** {job_current_file or '-'}")
+    st.progress(job_progress)
+
+    if job_results:
+        rows = []
+        for item in job_results:
+            rows.append({
+                "File": item.get("file_name"),
+                "Type": item.get("doc_type"),
+                "Status": item.get("status"),
+                "OCR": "Yes" if item.get("ocr_used") else "No",
+                "Reason": item.get("exception_reason") or "-",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=220)
+
+    if job_exceptions:
+        st.warning(f"{len(job_exceptions)} file(s) ended in exception.")
+
+    d1, d2 = st.columns(2)
+
+    with d1:
+        if job_zip:
+            st.download_button(
+                "Download Background Job Resumes",
+                data=job_zip,
+                file_name=job_zip_name or "background_job_resumes.zip",
+                mime="application/zip",
+                use_container_width=True,
+                key="job_resume_zip_download"
+            )
+
+    with d2:
+        if job_pdf:
+            st.download_button(
+                "Download Background Assessment PDF",
+                data=job_pdf,
+                file_name="BackgroundDetailedAssessment.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key="job_assessment_pdf_download"
+            )
+
+    if job_rankings:
+        with st.expander("Background Job JD Ranking", expanded=False):
+            ranking_rows = []
+            for item in job_rankings:
+                ranking_rows.append({
+                    "Rank": item.get("rank"),
+                    "Candidate": item.get("candidate_name"),
+                    "File": item.get("file_name"),
+                    "Overall": item.get("overall_score"),
+                    "Recommendation": item.get("recommendation"),
+                })
+            st.dataframe(pd.DataFrame(ranking_rows), use_container_width=True, hide_index=True)
+            
 # ------------------------------
 # REVIEW / ACTIONS
 # ------------------------------
@@ -1625,8 +1924,7 @@ def render_sidebar_and_upload():
         uploaded_files = st.session_state.get("remote_uploaded_files", [])
 
     if uploaded_files and len(uploaded_files) > MAX_BATCH_FILES:
-        st.error(f"Batch limit exceeded. Maximum allowed is {MAX_BATCH_FILES} files.")
-        uploaded_files = uploaded_files[:MAX_BATCH_FILES]
+        st.error(f"Batch limit exceeded for direct processing. Maximum allowed is {MAX_BATCH_FILES} files.")
 
     st.markdown("---")
     return uploaded_files
@@ -2312,93 +2610,101 @@ with left_col:
 
     process_disabled = not uploaded_files
 
+    if st.button("Submit Background Job", use_container_width=True, disabled=process_disabled, key="submit_bg_job_btn"):
+        submit_background_batch_job(uploaded_files)
+
     if st.button("Process Batch", use_container_width=True, disabled=process_disabled):
-        if current_batch_signature and current_batch_signature == last_batch_signature:
-            st.session_state.show_reprocess_confirm = True
-            st.session_state.pending_batch_signature = current_batch_signature
-        else:
-            st.session_state.batch_results = []
-            st.session_state.exception_queue = []
-            st.session_state.jd_rankings = []
-            st.session_state.show_reprocess_confirm = False
-            st.session_state.pending_batch_signature = None
 
-            st.session_state.batch_started_at = time.time()
-            st.session_state.batch_completed_at = None
-            st.session_state.batch_elapsed_seconds = 0.0
-
-            st.session_state.batch_total_files = len(uploaded_files)
-            st.session_state.batch_processed_files = 0
-            st.session_state.batch_current_file = None
-            st.session_state.batch_file_statuses = [
-                {"file_name": f.name, "status": "pending", "message": ""}
-                for f in uploaded_files
-            ]
-            refresh_live_batch_activity()
-
-            for uploaded_file in uploaded_files:
-                try:
-                    st.session_state["current_file_started_at"] = time.time()
-                    st.session_state.batch_current_file = uploaded_file.name
-                    update_batch_file_status(uploaded_file.name, "running", "Processing started")
-                    refresh_live_batch_activity()
-
-                    result = process_single_file(uploaded_file)
-                    st.session_state.batch_results.append(result)
-
-                    if result.get("status") == "Exception":
-                        st.session_state.exception_queue.append(result)
-                        update_batch_file_status(
-                            uploaded_file.name,
-                            "error",
-                            result.get("exception_reason", "Exception")
-                        )
-                    elif result.get("status") == "Review Needed":
-                        update_batch_file_status(uploaded_file.name, "done", "Review Needed")
-                    else:
-                        update_batch_file_status(
-                            uploaded_file.name,
-                            "done",
-                            result.get("status", "Completed")
-                        )
-
-                except Exception as e:
-                    error_result = {
-                        "file_name": uploaded_file.name,
-                        "status": "Exception",
-                        "doc_type": "unknown",
-                        "ocr_used": False,
-                        "exception_reason": f"Unhandled error: {str(e)}",
-                        "cost": 0.0,
-                        "tokens": 0,
-                        "duplicate_info": {
-                            "is_duplicate": False,
-                            "match_file": None,
-                            "reason": None,
-                            "score": 0.0,
-                        },
-                        "agent_events": deepcopy(st.session_state.get("agent_events", [])),
-                        "agent_timings": deepcopy(st.session_state.get("agent_timings", {})),
-                    }
-                    st.session_state.batch_results.append(error_result)
-                    st.session_state.exception_queue.append(error_result)
-                    update_batch_file_status(uploaded_file.name, "error", f"Unhandled error: {str(e)}")
-
-                finally:
-                    st.session_state.batch_processed_files += 1
-                    st.session_state["progress_value"] = 0
-                    st.session_state["current_file_started_at"] = None
-                    refresh_live_batch_activity()
-
-            if st.session_state.batch_results:
-                load_batch_result_into_session(0)
-                st.session_state.batch_processed = True
-                st.session_state.last_batch_signature = current_batch_signature
-                st.session_state.batch_completed_at = time.time()
-                st.session_state.batch_elapsed_seconds = (
-                    st.session_state.batch_completed_at - st.session_state.batch_started_at
-                )
-                st.success("Batch processing completed")
+    if st.button("Process Batch", use_container_width=True, disabled=process_disabled):
+        if uploaded_files and len(uploaded_files) > MAX_BATCH_FILES:
+            st.error(f"Direct processing is limited to {MAX_BATCH_FILES} files. Use 'Submit Background Job' for large batches.")
+        else:    
+            if current_batch_signature and current_batch_signature == last_batch_signature:
+                st.session_state.show_reprocess_confirm = True
+                st.session_state.pending_batch_signature = current_batch_signature
+            else:
+                st.session_state.batch_results = []
+                st.session_state.exception_queue = []
+                st.session_state.jd_rankings = []
+                st.session_state.show_reprocess_confirm = False
+                st.session_state.pending_batch_signature = None
+    
+                st.session_state.batch_started_at = time.time()
+                st.session_state.batch_completed_at = None
+                st.session_state.batch_elapsed_seconds = 0.0
+    
+                st.session_state.batch_total_files = len(uploaded_files)
+                st.session_state.batch_processed_files = 0
+                st.session_state.batch_current_file = None
+                st.session_state.batch_file_statuses = [
+                    {"file_name": f.name, "status": "pending", "message": ""}
+                    for f in uploaded_files
+                ]
+                refresh_live_batch_activity()
+    
+                for uploaded_file in uploaded_files:
+                    try:
+                        st.session_state["current_file_started_at"] = time.time()
+                        st.session_state.batch_current_file = uploaded_file.name
+                        update_batch_file_status(uploaded_file.name, "running", "Processing started")
+                        refresh_live_batch_activity()
+    
+                        result = process_single_file(uploaded_file)
+                        st.session_state.batch_results.append(result)
+    
+                        if result.get("status") == "Exception":
+                            st.session_state.exception_queue.append(result)
+                            update_batch_file_status(
+                                uploaded_file.name,
+                                "error",
+                                result.get("exception_reason", "Exception")
+                            )
+                        elif result.get("status") == "Review Needed":
+                            update_batch_file_status(uploaded_file.name, "done", "Review Needed")
+                        else:
+                            update_batch_file_status(
+                                uploaded_file.name,
+                                "done",
+                                result.get("status", "Completed")
+                            )
+    
+                    except Exception as e:
+                        error_result = {
+                            "file_name": uploaded_file.name,
+                            "status": "Exception",
+                            "doc_type": "unknown",
+                            "ocr_used": False,
+                            "exception_reason": f"Unhandled error: {str(e)}",
+                            "cost": 0.0,
+                            "tokens": 0,
+                            "duplicate_info": {
+                                "is_duplicate": False,
+                                "match_file": None,
+                                "reason": None,
+                                "score": 0.0,
+                            },
+                            "agent_events": deepcopy(st.session_state.get("agent_events", [])),
+                            "agent_timings": deepcopy(st.session_state.get("agent_timings", {})),
+                        }
+                        st.session_state.batch_results.append(error_result)
+                        st.session_state.exception_queue.append(error_result)
+                        update_batch_file_status(uploaded_file.name, "error", f"Unhandled error: {str(e)}")
+    
+                    finally:
+                        st.session_state.batch_processed_files += 1
+                        st.session_state["progress_value"] = 0
+                        st.session_state["current_file_started_at"] = None
+                        refresh_live_batch_activity()
+    
+                if st.session_state.batch_results:
+                    load_batch_result_into_session(0)
+                    st.session_state.batch_processed = True
+                    st.session_state.last_batch_signature = current_batch_signature
+                    st.session_state.batch_completed_at = time.time()
+                    st.session_state.batch_elapsed_seconds = (
+                        st.session_state.batch_completed_at - st.session_state.batch_started_at
+                    )
+                    st.success("Batch processing completed")
 
     if st.session_state.get("show_reprocess_confirm"):
         st.warning("This same batch was already processed. Do you want to re-process it again?")
@@ -2514,6 +2820,10 @@ render_detailed_assessment_report()
 
 st.markdown("---")
 render_template_manager()
+
+st.markdown("---")
+render_job_notifications()
+render_background_job_monitor()
 
 with st.expander("Metrics", expanded=False):
     m = st.session_state.get("metrics", {})
