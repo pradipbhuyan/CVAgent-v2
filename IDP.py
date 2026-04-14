@@ -237,6 +237,56 @@ if not st.session_state["logged_in"]:
 # ------------------------------
 # HELPERS
 # ------------------------------
+def get_job_runtime_dir():
+    base = Path("job_runtime")
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def get_job_dir(job_id: str):
+    job_dir = get_job_runtime_dir() / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    return job_dir
+
+
+def get_job_meta_path(job_id: str):
+    return get_job_dir(job_id) / "job.json"
+
+
+def write_job_json(job_id: str, data: dict):
+    path = get_job_meta_path(job_id)
+    serializable = deepcopy(data)
+
+    # strip non-serializable source file objects before save
+    if "source_files" in serializable:
+        serializable["source_files"] = [
+            {"name": f.name, "content_hex": f.getvalue().hex()}
+            for f in serializable.get("source_files", [])
+        ]
+
+    path.write_text(json.dumps(serializable, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def read_job_json(job_id: str):
+    path = get_job_meta_path(job_id)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_job_binary(job_id: str, filename: str, content: bytes):
+    path = get_job_dir(job_id) / filename
+    path.write_bytes(content)
+    return str(path)
+
+
+def load_job_binary(path_str: str):
+    path = Path(path_str)
+    if path.exists():
+        return path.read_bytes()
+    return None
+
+
 def get_incomplete_files_for_job(job):
     completed_names = set()
 
@@ -247,7 +297,7 @@ def get_incomplete_files_for_job(job):
             completed_names.add(file_name)
 
     remaining = []
-    for f in job.get("source_files", []) or []:
+    for f in restore_source_files_from_job(job):
         if getattr(f, "name", None) not in completed_names:
             remaining.append(f)
 
@@ -305,60 +355,59 @@ def resume_background_batch_job():
     thread.start()
     st.success(f"Background batch job resumed for {len(remaining_files)} remaining file(s).")
 
-
 def create_background_job_record(uploaded_files, jd_text):
     job_id = str(uuid.uuid4())
 
-    with BACKGROUND_JOBS_LOCK:
-        BACKGROUND_JOBS[job_id] = {
-            "job_id": job_id,
-            "status": "Queued",
-            "progress": 0,
-            "total_files": len(uploaded_files),
-            "processed_files": 0,
-            "current_file": None,
-            "results": [],
-            "exceptions": [],
-            "output_zip": None,
-            "output_zip_name": None,
-            "assessment_pdf": None,
-            "rankings": [],
-            "notifications": [],
-            "jd_text": jd_text,
-            "source_files": uploaded_files,
-            "is_running": False,
-            "last_error": None,
-            "last_update": time.time(),
-        }
+    job = {
+        "job_id": job_id,
+        "status": "Queued",
+        "progress": 0,
+        "total_files": len(uploaded_files),
+        "processed_files": 0,
+        "current_file": None,
+        "results": [],
+        "exceptions": [],
+        "output_zip_path": None,
+        "output_zip_name": None,
+        "assessment_pdf_path": None,
+        "rankings": [],
+        "notifications": [],
+        "jd_text": jd_text,
+        "source_files": uploaded_files,
+        "is_running": False,
+        "last_error": None,
+        "last_update": time.time(),
+        "created_at": time.time(),
+    }
 
+    write_job_json(job_id, job)
     return job_id
 
 
 def update_background_job(job_id, **kwargs):
-    with BACKGROUND_JOBS_LOCK:
-        job = BACKGROUND_JOBS.get(job_id)
-        if not job:
-            return
-        kwargs["last_update"] = time.time()
-        job.update(kwargs)
+    job = read_job_json(job_id)
+    if not job:
+        return
+
+    job.update(kwargs)
+    job["last_update"] = time.time()
+    write_job_json(job_id, job)
+
 
 def append_background_job_notification(job_id, message):
-    with BACKGROUND_JOBS_LOCK:
-        job = BACKGROUND_JOBS.get(job_id)
-        if not job:
-            return
-        notifications = list(job.get("notifications", []))
-        notifications.append(message)
-        job["notifications"] = notifications
+    job = read_job_json(job_id)
+    if not job:
+        return
+
+    notifications = list(job.get("notifications", []))
+    notifications.append(message)
+    job["notifications"] = notifications
+    job["last_update"] = time.time()
+    write_job_json(job_id, job)
 
 
 def get_background_job(job_id):
-    with BACKGROUND_JOBS_LOCK:
-        job = BACKGROUND_JOBS.get(job_id)
-        if not job:
-            return None
-        return deepcopy(job)
-
+    return read_job_json(job_id)
 
 def reset_source_state():
     st.session_state.batch_results = []
@@ -378,6 +427,16 @@ def reset_source_state():
     st.session_state.source_mode = "Local Upload"
     reset_run_state()
 
+def restore_source_files_from_job(job):
+    files = []
+    for item in job.get("source_files", []) or []:
+        files.append(
+            RemoteUploadedFile(
+                name=item["name"],
+                content=bytes.fromhex(item["content_hex"]),
+            )
+        )
+    return files
 
 def extract_jd_text_from_upload(uploaded_file):
     if not uploaded_file:
@@ -1481,37 +1540,13 @@ def run_background_batch_job(job_id, uploaded_files, jd_text):
             current_file=None,
             results=[],
             exceptions=[],
-            output_zip=None,
+            output_zip_path=None,
             output_zip_name=None,
-            assessment_pdf=None,
+            assessment_pdf_path=None,
             rankings=[],
             is_running=True,
             last_error=None,
         )
-
-        preserved_state = {
-            "batch_results": deepcopy(st.session_state.get("batch_results", [])),
-            "exception_queue": deepcopy(st.session_state.get("exception_queue", [])),
-            "active_batch_index": st.session_state.get("active_batch_index", 0),
-            "review_data": deepcopy(st.session_state.get("review_data")),
-            "confidence_map": deepcopy(st.session_state.get("confidence_map")),
-            "validation_result": deepcopy(st.session_state.get("validation_result")),
-            "duplicate_info": deepcopy(st.session_state.get("duplicate_info")),
-            "vectorstore": st.session_state.get("vectorstore"),
-            "chat_history": deepcopy(st.session_state.get("chat_history", [])),
-            "suggested_questions": deepcopy(st.session_state.get("suggested_questions", [])),
-            "current_file": st.session_state.get("current_file"),
-            "doc_type": st.session_state.get("doc_type"),
-            "full_text": st.session_state.get("full_text"),
-            "auto_result": deepcopy(st.session_state.get("auto_result")),
-            "generated_resume": st.session_state.get("generated_resume"),
-            "agent_events": deepcopy(st.session_state.get("agent_events", [])),
-            "agent_timings": deepcopy(st.session_state.get("agent_timings", {})),
-            "agent_logs": deepcopy(st.session_state.get("agent_logs", [])),
-            "active_agent": st.session_state.get("active_agent"),
-            "current_step": st.session_state.get("current_step", "Waiting"),
-            "progress_value": st.session_state.get("progress_value", 0),
-        }
 
         local_results = []
         local_exceptions = []
@@ -1584,7 +1619,7 @@ def run_background_batch_job(job_id, uploaded_files, jd_text):
             )
 
         rankings = rank_resumes_against_jd_for_results(local_results, jd_text)
-        assessment_pdf = None
+        assessment_pdf_path = None
 
         if rankings:
             update_background_job(job_id, status="Generating assessment report")
@@ -1593,10 +1628,12 @@ def run_background_batch_job(job_id, uploaded_files, jd_text):
                 jd_text=jd_text,
                 jd_rankings=rankings,
             )
-            assessment_pdf = build_consolidated_assessment_pdf(report_data)
+            pdf_bytes = build_consolidated_assessment_pdf(report_data)
+            assessment_pdf_path = save_job_binary(job_id, "BackgroundDetailedAssessment.pdf", pdf_bytes)
 
         update_background_job(job_id, status="Building resume ZIP")
         resume_zip = build_zip_from_results(local_results, "resume")
+        zip_path = save_job_binary(job_id, "background_job_resumes.zip", resume_zip)
 
         final_status = "Completed"
         if local_exceptions:
@@ -1610,8 +1647,8 @@ def run_background_batch_job(job_id, uploaded_files, jd_text):
             results=local_results,
             exceptions=local_exceptions,
             rankings=rankings,
-            assessment_pdf=assessment_pdf,
-            output_zip=resume_zip,
+            assessment_pdf_path=assessment_pdf_path,
+            output_zip_path=zip_path,
             output_zip_name="background_job_resumes.zip",
             is_running=False,
         )
@@ -1620,9 +1657,6 @@ def run_background_batch_job(job_id, uploaded_files, jd_text):
             job_id,
             f"Background batch completed successfully. Processed {len(local_results)} file(s)."
         )
-
-        for key, value in preserved_state.items():
-            st.session_state[key] = value
 
     except Exception as e:
         update_background_job(
@@ -1636,7 +1670,6 @@ def run_background_batch_job(job_id, uploaded_files, jd_text):
             job_id,
             f"Background batch failed: {str(e)}"
         )
-
 
 def submit_background_batch_job(uploaded_files):
     jd_text = (st.session_state.get("jd_text") or "").strip()
@@ -1652,7 +1685,7 @@ def submit_background_batch_job(uploaded_files):
     active_job_id = st.session_state.get("active_background_job_id")
     if active_job_id:
         active_job = get_background_job(active_job_id)
-        if active_job and str(active_job.get("status", "")).startswith(("Queued", "Running", "Processing")):
+        if active_job and active_job.get("is_running"):
             st.warning("A background batch job is already running.")
             return
 
@@ -1666,7 +1699,6 @@ def submit_background_batch_job(uploaded_files):
     )
     thread.start()
     st.success("Background batch job started.")
-
 
 
 def render_job_notifications():
@@ -1685,7 +1717,6 @@ def render_job_notifications():
             st.toast(latest)
         except Exception:
             st.success(latest)
-
 
 def render_background_job_monitor():
     st.markdown("### Background Batch Job")
@@ -1707,9 +1738,9 @@ def render_background_job_monitor():
     job_current_file = job.get("current_file")
     job_results = job.get("results", []) or []
     job_exceptions = job.get("exceptions", []) or []
-    job_zip = job.get("output_zip")
+    job_zip_path = job.get("output_zip_path")
     job_zip_name = job.get("output_zip_name")
-    job_pdf = job.get("assessment_pdf")
+    job_pdf_path = job.get("assessment_pdf_path")
     job_rankings = job.get("rankings", []) or []
     job_is_running = bool(job.get("is_running", False))
     last_error = job.get("last_error")
@@ -1766,26 +1797,30 @@ def render_background_job_monitor():
     d1, d2 = st.columns(2)
 
     with d1:
-        if job_zip:
-            st.download_button(
-                "Download Background Job Resumes",
-                data=job_zip,
-                file_name=job_zip_name or "background_job_resumes.zip",
-                mime="application/zip",
-                use_container_width=True,
-                key=f"job_resume_zip_download_{job_id}"
-            )
+        if job_zip_path:
+            zip_bytes = load_job_binary(job_zip_path)
+            if zip_bytes:
+                st.download_button(
+                    "Download Background Job Resumes",
+                    data=zip_bytes,
+                    file_name=job_zip_name or "background_job_resumes.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                    key=f"job_resume_zip_download_{job_id}"
+                )
 
     with d2:
-        if job_pdf:
-            st.download_button(
-                "Download Background Assessment PDF",
-                data=job_pdf,
-                file_name="BackgroundDetailedAssessment.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-                key=f"job_assessment_pdf_download_{job_id}"
-            )
+        if job_pdf_path:
+            pdf_bytes = load_job_binary(job_pdf_path)
+            if pdf_bytes:
+                st.download_button(
+                    "Download Background Assessment PDF",
+                    data=pdf_bytes,
+                    file_name="BackgroundDetailedAssessment.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    key=f"job_assessment_pdf_download_{job_id}"
+                )
 
     if job_rankings:
         with st.expander("Background Job JD Ranking", expanded=False):
@@ -1799,6 +1834,7 @@ def render_background_job_monitor():
                     "Recommendation": item.get("recommendation"),
                 })
             st.dataframe(pd.DataFrame(ranking_rows), use_container_width=True, hide_index=True)
+
 
 def push_job_notification(message):
     if "job_notifications" not in st.session_state:
