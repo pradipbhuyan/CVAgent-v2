@@ -237,6 +237,75 @@ if not st.session_state["logged_in"]:
 # ------------------------------
 # HELPERS
 # ------------------------------
+def get_incomplete_files_for_job(job):
+    completed_names = set()
+
+    for item in job.get("results", []):
+        status = item.get("status")
+        file_name = item.get("file_name")
+        if status in ["Completed", "Review Needed"] and file_name:
+            completed_names.add(file_name)
+
+    remaining = []
+    for f in job.get("source_files", []) or []:
+        if getattr(f, "name", None) not in completed_names:
+            remaining.append(f)
+
+    return remaining
+
+
+def can_resume_background_job(job):
+    if not job:
+        return False
+
+    status = str(job.get("status", ""))
+    if job.get("is_running"):
+        return False
+
+    if status == "Completed":
+        return False
+
+    remaining = get_incomplete_files_for_job(job)
+    return len(remaining) > 0
+
+
+def resume_background_batch_job():
+    job_id = st.session_state.get("active_background_job_id")
+    if not job_id:
+        st.warning("No background job found to resume.")
+        return
+
+    job = get_background_job(job_id)
+    if not job:
+        st.warning("Background job not found.")
+        return
+
+    if job.get("is_running"):
+        st.warning("Background job is already running.")
+        return
+
+    if not can_resume_background_job(job):
+        st.warning("No resumable files found for this batch job.")
+        return
+
+    jd_text = job.get("jd_text", "")
+    remaining_files = get_incomplete_files_for_job(job)
+
+    update_background_job(
+        job_id,
+        status="Queued for Resume",
+        is_running=True,
+    )
+
+    thread = threading.Thread(
+        target=run_background_batch_job,
+        args=(job_id, remaining_files, jd_text),
+        daemon=True,
+    )
+    thread.start()
+    st.success(f"Background batch job resumed for {len(remaining_files)} remaining file(s).")
+
+
 def create_background_job_record(uploaded_files, jd_text):
     job_id = str(uuid.uuid4())
 
@@ -256,6 +325,10 @@ def create_background_job_record(uploaded_files, jd_text):
             "rankings": [],
             "notifications": [],
             "jd_text": jd_text,
+            "source_files": uploaded_files,
+            "is_running": False,
+            "last_error": None,
+            "last_update": time.time(),
         }
 
     return job_id
@@ -266,8 +339,8 @@ def update_background_job(job_id, **kwargs):
         job = BACKGROUND_JOBS.get(job_id)
         if not job:
             return
+        kwargs["last_update"] = time.time()
         job.update(kwargs)
-
 
 def append_background_job_notification(job_id, message):
     with BACKGROUND_JOBS_LOCK:
@@ -1094,6 +1167,130 @@ def process_single_file(uploaded_file):
         "agent_timings": deepcopy(st.session_state.get("agent_timings", {})),
     }
 
+def process_single_file_for_job(uploaded_file, existing_results=None):
+    existing_results = existing_results or []
+
+    extracted = process_file_with_fallback(uploaded_file)
+    docs = extracted["documents"]
+    full_text = extracted["text"]
+
+    if not full_text:
+        reason = extracted["exception_reason"] or "No extractable text"
+        return {
+            "file_name": uploaded_file.name,
+            "status": "Exception",
+            "doc_type": "unknown",
+            "ocr_used": extracted["ocr_used"],
+            "exception_reason": reason,
+            "cost": 0.0,
+            "tokens": 0,
+            "duplicate_info": {
+                "is_duplicate": False,
+                "match_file": None,
+                "reason": None,
+                "score": 0.0,
+            },
+            "review_data": None,
+            "validation": None,
+            "confidence": None,
+            "auto_result": None,
+            "vectorstore": None,
+            "full_text": None,
+        }
+
+    vectorstore = create_vectorstore(docs)
+
+    graph = build_graph()
+    graph_input = {
+        "text": full_text,
+        "filename": uploaded_file.name,
+        "template": get_active_template_bytes(),
+        "progress": lambda percent, message: None,
+        "event_callback": lambda step, status, message="": None,
+        "ocr_used": extracted["ocr_used"],
+        "extraction_mode": extracted["extraction_mode"],
+        "exception_reason": extracted["exception_reason"],
+    }
+
+    before_cost = st.session_state.get("metrics", {}).get("cost", 0.0)
+    before_tokens = st.session_state.get("metrics", {}).get("tokens", 0)
+
+    raw_result = graph.invoke(graph_input)
+    normalized = normalize_graph_result(raw_result)
+
+    doc_type = normalized.get("doc_type")
+    result = normalized.get("result", {})
+    review_data = result.get("data") or normalized.get("structured_data") or {}
+
+    if doc_type != "resume":
+        return {
+            "file_name": uploaded_file.name,
+            "status": "Exception",
+            "doc_type": doc_type or "unknown",
+            "ocr_used": extracted["ocr_used"],
+            "exception_reason": f"Not a CV/Resume (detected: {doc_type or 'unknown'})",
+            "review_data": None,
+            "validation": None,
+            "confidence": None,
+            "duplicate_info": None,
+            "auto_result": None,
+            "vectorstore": None,
+            "full_text": None,
+            "cost": 0.0,
+            "tokens": 0,
+        }
+
+    validation = normalized.get("validation") or validate_document_data(review_data, doc_type)
+    confidence = normalized.get("confidence") or build_confidence_map(review_data, doc_type)
+
+    duplicate_info = detect_duplicate_document(
+        new_doc_type=doc_type,
+        new_data=review_data,
+        existing_results=existing_results,
+    )
+
+    exception_reason = classify_exception(
+        doc_type=doc_type,
+        text=full_text,
+        validation=validation,
+        confidence=confidence,
+        extraction_meta=extracted,
+    )
+
+    after_cost = st.session_state.get("metrics", {}).get("cost", 0.0)
+    after_tokens = st.session_state.get("metrics", {}).get("tokens", 0)
+
+    status = "Completed"
+    if exception_reason:
+        status = "Exception"
+    elif not validation.get("passed", True):
+        status = "Review Needed"
+
+    return {
+        "file_name": uploaded_file.name,
+        "status": status,
+        "doc_type": doc_type,
+        "ocr_used": extracted["ocr_used"],
+        "exception_reason": exception_reason,
+        "review_data": review_data,
+        "validation": validation,
+        "confidence": confidence,
+        "duplicate_info": duplicate_info,
+        "auto_result": {
+            "doc_type": doc_type,
+            "structured_data": normalized.get("structured_data"),
+            "result": result,
+            "metrics": {},
+            "step_metrics": normalized.get("step_metrics", []),
+            "ocr_used": extracted["ocr_used"],
+            "extraction_mode": extracted["extraction_mode"],
+        },
+        "vectorstore": vectorstore,
+        "full_text": full_text,
+        "cost": round(after_cost - before_cost, 6),
+        "tokens": after_tokens - before_tokens,
+    }
+
 
 def load_batch_result_into_session(index):
     if index < 0 or index >= len(st.session_state.batch_results):
@@ -1288,6 +1485,8 @@ def run_background_batch_job(job_id, uploaded_files, jd_text):
             output_zip_name=None,
             assessment_pdf=None,
             rankings=[],
+            is_running=True,
+            last_error=None,
         )
 
         preserved_state = {
@@ -1322,16 +1521,28 @@ def run_background_batch_job(job_id, uploaded_files, jd_text):
             update_background_job(
                 job_id,
                 current_file=uploaded_file.name,
-                status=f"Processing {uploaded_file.name}",
+                status=f"Extracting/processing {uploaded_file.name}",
                 progress=int(((idx - 1) / max(total_files, 1)) * 100),
+                results=local_results,
+                exceptions=local_exceptions,
             )
 
             try:
-                result = process_single_file(uploaded_file)
+                result = process_single_file_for_job(
+                    uploaded_file,
+                    existing_results=local_results,
+                )
                 local_results.append(result)
 
                 if result.get("status") == "Exception":
                     local_exceptions.append(result)
+
+                update_background_job(
+                    job_id,
+                    status=f"Finished {uploaded_file.name}",
+                    results=local_results,
+                    exceptions=local_exceptions,
+                )
 
             except Exception as e:
                 error_result = {
@@ -1358,6 +1569,14 @@ def run_background_batch_job(job_id, uploaded_files, jd_text):
                 local_results.append(error_result)
                 local_exceptions.append(error_result)
 
+                update_background_job(
+                    job_id,
+                    status=f"Error in {uploaded_file.name}",
+                    results=local_results,
+                    exceptions=local_exceptions,
+                    last_error=str(e),
+                )
+
             update_background_job(
                 job_id,
                 processed_files=idx,
@@ -1368,6 +1587,7 @@ def run_background_batch_job(job_id, uploaded_files, jd_text):
         assessment_pdf = None
 
         if rankings:
+            update_background_job(job_id, status="Generating assessment report")
             report_data = generate_consolidated_assessment_data(
                 batch_results=local_results,
                 jd_text=jd_text,
@@ -1375,11 +1595,16 @@ def run_background_batch_job(job_id, uploaded_files, jd_text):
             )
             assessment_pdf = build_consolidated_assessment_pdf(report_data)
 
+        update_background_job(job_id, status="Building resume ZIP")
         resume_zip = build_zip_from_results(local_results, "resume")
+
+        final_status = "Completed"
+        if local_exceptions:
+            final_status = "Completed with Exceptions"
 
         update_background_job(
             job_id,
-            status="Completed",
+            status=final_status,
             progress=100,
             current_file=None,
             results=local_results,
@@ -1388,6 +1613,7 @@ def run_background_batch_job(job_id, uploaded_files, jd_text):
             assessment_pdf=assessment_pdf,
             output_zip=resume_zip,
             output_zip_name="background_job_resumes.zip",
+            is_running=False,
         )
 
         append_background_job_notification(
@@ -1403,11 +1629,14 @@ def run_background_batch_job(job_id, uploaded_files, jd_text):
             job_id,
             status=f"Failed: {str(e)}",
             current_file=None,
+            is_running=False,
+            last_error=str(e),
         )
         append_background_job_notification(
             job_id,
             f"Background batch failed: {str(e)}"
         )
+
 
 def submit_background_batch_job(uploaded_files):
     jd_text = (st.session_state.get("jd_text") or "").strip()
@@ -1482,8 +1711,28 @@ def render_background_job_monitor():
     job_zip_name = job.get("output_zip_name")
     job_pdf = job.get("assessment_pdf")
     job_rankings = job.get("rankings", []) or []
+    job_is_running = bool(job.get("is_running", False))
+    last_error = job.get("last_error")
+    last_update = job.get("last_update")
+    resumable = can_resume_background_job(job)
 
-    if str(job_status).startswith(("Queued", "Running", "Processing")):
+    c1, c2 = st.columns(2)
+
+    with c1:
+        if st.button("Refresh Job Status", use_container_width=True, key=f"refresh_bg_job_{job_id}"):
+            st.rerun()
+
+    with c2:
+        if st.button(
+            "Resume Background Job",
+            use_container_width=True,
+            disabled=not resumable,
+            key=f"resume_bg_job_{job_id}"
+        ):
+            resume_background_batch_job()
+            st.rerun()
+
+    if job_is_running or str(job_status).startswith(("Queued", "Running", "Processing", "Resuming")):
         st.info("Background batch is running.")
     else:
         st.caption("Background batch is not active.")
@@ -1492,6 +1741,12 @@ def render_background_job_monitor():
     st.markdown(f"**Processed:** {job_processed_files} / {job_total_files}")
     st.markdown(f"**Current File:** {job_current_file or '-'}")
     st.progress(max(0, min(100, job_progress)))
+
+    if last_update:
+        st.caption(f"Last update heartbeat: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_update))}")
+
+    if last_error:
+        st.warning(f"Last error: {last_error}")
 
     if job_results:
         rows = []
