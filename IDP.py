@@ -15,6 +15,7 @@ from pathlib import Path
 from copy import deepcopy
 import textwrap
 import json
+import uuid
 
 import pandas as pd
 import streamlit as st
@@ -79,6 +80,9 @@ class RemoteUploadedFile:
 st.set_page_config("IDP - Professional", layout="wide")
 USERS = st.secrets.get("users", {})
 MAX_BATCH_FILES = 15
+
+BACKGROUND_JOBS = {}
+BACKGROUND_JOBS_LOCK = threading.Lock()
 
 # ------------------------------
 # CACHED MODELS
@@ -220,6 +224,7 @@ DEFAULT_KEYS = {
     "job_rankings": [],
     "job_notifications": [],
     "job_thread_started": False,
+    "active_background_job_id": None,
 }
 for key, value in DEFAULT_KEYS.items():
     if key not in st.session_state:
@@ -232,6 +237,56 @@ if not st.session_state["logged_in"]:
 # ------------------------------
 # HELPERS
 # ------------------------------
+def create_background_job_record(uploaded_files, jd_text):
+    job_id = str(uuid.uuid4())
+
+    with BACKGROUND_JOBS_LOCK:
+        BACKGROUND_JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "Queued",
+            "progress": 0,
+            "total_files": len(uploaded_files),
+            "processed_files": 0,
+            "current_file": None,
+            "results": [],
+            "exceptions": [],
+            "output_zip": None,
+            "output_zip_name": None,
+            "assessment_pdf": None,
+            "rankings": [],
+            "notifications": [],
+            "jd_text": jd_text,
+        }
+
+    return job_id
+
+
+def update_background_job(job_id, **kwargs):
+    with BACKGROUND_JOBS_LOCK:
+        job = BACKGROUND_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(kwargs)
+
+
+def append_background_job_notification(job_id, message):
+    with BACKGROUND_JOBS_LOCK:
+        job = BACKGROUND_JOBS.get(job_id)
+        if not job:
+            return
+        notifications = list(job.get("notifications", []))
+        notifications.append(message)
+        job["notifications"] = notifications
+
+
+def get_background_job(job_id):
+    with BACKGROUND_JOBS_LOCK:
+        job = BACKGROUND_JOBS.get(job_id)
+        if not job:
+            return None
+        return deepcopy(job)
+
+
 def reset_source_state():
     st.session_state.batch_results = []
     st.session_state.exception_queue = []
@@ -1218,64 +1273,58 @@ def compact_field(label, value):
         unsafe_allow_html=True
     )
 
-def run_background_batch_job(uploaded_files, jd_text):
-    def ss_get(key, default=None):
-        return st.session_state.get(key, default)
 
-    def ss_set(key, value):
-        st.session_state[key] = value
-
+def run_background_batch_job(job_id, uploaded_files, jd_text):
     try:
-        if "job_notifications" not in st.session_state:
-            st.session_state["job_notifications"] = []
+        update_background_job(
+            job_id,
+            status="Running",
+            progress=0,
+            processed_files=0,
+            current_file=None,
+            results=[],
+            exceptions=[],
+            output_zip=None,
+            output_zip_name=None,
+            assessment_pdf=None,
+            rankings=[],
+        )
 
-        ss_set("job_running", True)
-        ss_set("job_status", "Running")
-        ss_set("job_progress", 0)
-        ss_set("job_total_files", len(uploaded_files))
-        ss_set("job_processed_files", 0)
-        ss_set("job_current_file", None)
-        ss_set("job_results", [])
-        ss_set("job_exception_queue", [])
-        ss_set("job_output_zip", None)
-        ss_set("job_output_zip_name", None)
-        ss_set("job_assessment_pdf", None)
-        ss_set("job_rankings", [])
-
-        # Preserve visible foreground state as much as possible
         preserved_state = {
-            "batch_results": deepcopy(ss_get("batch_results", [])),
-            "exception_queue": deepcopy(ss_get("exception_queue", [])),
-            "active_batch_index": ss_get("active_batch_index", 0),
-            "review_data": deepcopy(ss_get("review_data")),
-            "confidence_map": deepcopy(ss_get("confidence_map")),
-            "validation_result": deepcopy(ss_get("validation_result")),
-            "duplicate_info": deepcopy(ss_get("duplicate_info")),
-            "vectorstore": ss_get("vectorstore"),
-            "chat_history": deepcopy(ss_get("chat_history", [])),
-            "suggested_questions": deepcopy(ss_get("suggested_questions", [])),
-            "current_file": ss_get("current_file"),
-            "doc_type": ss_get("doc_type"),
-            "full_text": ss_get("full_text"),
-            "auto_result": deepcopy(ss_get("auto_result")),
-            "generated_resume": ss_get("generated_resume"),
-            "agent_events": deepcopy(ss_get("agent_events", [])),
-            "agent_timings": deepcopy(ss_get("agent_timings", {})),
-            "agent_logs": deepcopy(ss_get("agent_logs", [])),
-            "active_agent": ss_get("active_agent"),
-            "current_step": ss_get("current_step", "Waiting"),
-            "progress_value": ss_get("progress_value", 0),
+            "batch_results": deepcopy(st.session_state.get("batch_results", [])),
+            "exception_queue": deepcopy(st.session_state.get("exception_queue", [])),
+            "active_batch_index": st.session_state.get("active_batch_index", 0),
+            "review_data": deepcopy(st.session_state.get("review_data")),
+            "confidence_map": deepcopy(st.session_state.get("confidence_map")),
+            "validation_result": deepcopy(st.session_state.get("validation_result")),
+            "duplicate_info": deepcopy(st.session_state.get("duplicate_info")),
+            "vectorstore": st.session_state.get("vectorstore"),
+            "chat_history": deepcopy(st.session_state.get("chat_history", [])),
+            "suggested_questions": deepcopy(st.session_state.get("suggested_questions", [])),
+            "current_file": st.session_state.get("current_file"),
+            "doc_type": st.session_state.get("doc_type"),
+            "full_text": st.session_state.get("full_text"),
+            "auto_result": deepcopy(st.session_state.get("auto_result")),
+            "generated_resume": st.session_state.get("generated_resume"),
+            "agent_events": deepcopy(st.session_state.get("agent_events", [])),
+            "agent_timings": deepcopy(st.session_state.get("agent_timings", {})),
+            "agent_logs": deepcopy(st.session_state.get("agent_logs", [])),
+            "active_agent": st.session_state.get("active_agent"),
+            "current_step": st.session_state.get("current_step", "Waiting"),
+            "progress_value": st.session_state.get("progress_value", 0),
         }
 
         local_results = []
         local_exceptions = []
-
         total_files = len(uploaded_files)
 
         for idx, uploaded_file in enumerate(uploaded_files, start=1):
-            ss_set("job_current_file", uploaded_file.name)
-            ss_set("job_status", f"Processing {uploaded_file.name}")
-            ss_set("job_progress", int(((idx - 1) / max(total_files, 1)) * 100))
+            update_background_job(
+                job_id,
+                current_file=uploaded_file.name,
+                status=f"Processing {uploaded_file.name}",
+                progress=int(((idx - 1) / max(total_files, 1)) * 100),
+            )
 
             try:
                 result = process_single_file(uploaded_file)
@@ -1309,14 +1358,14 @@ def run_background_batch_job(uploaded_files, jd_text):
                 local_results.append(error_result)
                 local_exceptions.append(error_result)
 
-            ss_set("job_processed_files", idx)
-            ss_set("job_progress", int((idx / max(total_files, 1)) * 100))
-
-        ss_set("job_results", local_results)
-        ss_set("job_exception_queue", local_exceptions)
+            update_background_job(
+                job_id,
+                processed_files=idx,
+                progress=int((idx / max(total_files, 1)) * 100),
+            )
 
         rankings = rank_resumes_against_jd_for_results(local_results, jd_text)
-        ss_set("job_rankings", rankings)
+        assessment_pdf = None
 
         if rankings:
             report_data = generate_consolidated_assessment_data(
@@ -1324,45 +1373,43 @@ def run_background_batch_job(uploaded_files, jd_text):
                 jd_text=jd_text,
                 jd_rankings=rankings,
             )
-            pdf_bytes = build_consolidated_assessment_pdf(report_data)
-            ss_set("job_assessment_pdf", pdf_bytes)
+            assessment_pdf = build_consolidated_assessment_pdf(report_data)
 
         resume_zip = build_zip_from_results(local_results, "resume")
-        ss_set("job_output_zip", resume_zip)
-        ss_set("job_output_zip_name", "background_job_resumes.zip")
 
-        ss_set("job_status", "Completed")
-        ss_set("job_progress", 100)
-        ss_set("job_current_file", None)
+        update_background_job(
+            job_id,
+            status="Completed",
+            progress=100,
+            current_file=None,
+            results=local_results,
+            exceptions=local_exceptions,
+            rankings=rankings,
+            assessment_pdf=assessment_pdf,
+            output_zip=resume_zip,
+            output_zip_name="background_job_resumes.zip",
+        )
 
-        push_job_notification(
+        append_background_job_notification(
+            job_id,
             f"Background batch completed successfully. Processed {len(local_results)} file(s)."
         )
 
-        # Restore foreground state
         for key, value in preserved_state.items():
             st.session_state[key] = value
 
     except Exception as e:
-        try:
-            ss_set("job_status", f"Failed: {str(e)}")
-            push_job_notification(f"Background batch failed: {str(e)}")
-        except Exception:
-            pass
-    finally:
-        try:
-            ss_set("job_running", False)
-            ss_set("job_current_file", None)
-        except Exception:
-            pass
+        update_background_job(
+            job_id,
+            status=f"Failed: {str(e)}",
+            current_file=None,
+        )
+        append_background_job_notification(
+            job_id,
+            f"Background batch failed: {str(e)}"
+        )
 
 def submit_background_batch_job(uploaded_files):
-    if "job_notifications" not in st.session_state:
-        st.session_state["job_notifications"] = []
-
-    if "job_running" not in st.session_state:
-        st.session_state["job_running"] = False
-
     jd_text = (st.session_state.get("jd_text") or "").strip()
 
     if not jd_text:
@@ -1373,38 +1420,36 @@ def submit_background_batch_job(uploaded_files):
         st.warning("No CV files available for background job.")
         return
 
-    if st.session_state.get("job_running", False):
-        st.warning("A background batch job is already running.")
-        return
+    active_job_id = st.session_state.get("active_background_job_id")
+    if active_job_id:
+        active_job = get_background_job(active_job_id)
+        if active_job and str(active_job.get("status", "")).startswith(("Queued", "Running", "Processing")):
+            st.warning("A background batch job is already running.")
+            return
 
-    # Initialize all job keys explicitly before starting thread
-    st.session_state["job_running"] = False
-    st.session_state["job_status"] = "Queued"
-    st.session_state["job_progress"] = 0
-    st.session_state["job_total_files"] = len(uploaded_files)
-    st.session_state["job_processed_files"] = 0
-    st.session_state["job_current_file"] = None
-    st.session_state["job_results"] = []
-    st.session_state["job_exception_queue"] = []
-    st.session_state["job_output_zip"] = None
-    st.session_state["job_output_zip_name"] = None
-    st.session_state["job_assessment_pdf"] = None
-    st.session_state["job_rankings"] = []
+    job_id = create_background_job_record(uploaded_files, jd_text)
+    st.session_state["active_background_job_id"] = job_id
 
     thread = threading.Thread(
         target=run_background_batch_job,
-        args=(uploaded_files, jd_text),
+        args=(job_id, uploaded_files, jd_text),
         daemon=True,
     )
     thread.start()
-    st.session_state["job_thread_started"] = True
     st.success("Background batch job started.")
 
-def render_job_notifications():
-    if "job_notifications" not in st.session_state:
-        st.session_state["job_notifications"] = []
 
-    notifications = st.session_state.get("job_notifications", [])
+
+def render_job_notifications():
+    job_id = st.session_state.get("active_background_job_id")
+    if not job_id:
+        return
+
+    job = get_background_job(job_id)
+    if not job:
+        return
+
+    notifications = job.get("notifications", [])
     if notifications:
         latest = notifications[-1]
         try:
@@ -1416,50 +1461,32 @@ def render_job_notifications():
 def render_background_job_monitor():
     st.markdown("### Background Batch Job")
 
-    if "job_notifications" not in st.session_state:
-        st.session_state["job_notifications"] = []
-    if "job_running" not in st.session_state:
-        st.session_state["job_running"] = False
-    if "job_status" not in st.session_state:
-        st.session_state["job_status"] = "Idle"
-    if "job_progress" not in st.session_state:
-        st.session_state["job_progress"] = 0
-    if "job_total_files" not in st.session_state:
-        st.session_state["job_total_files"] = 0
-    if "job_processed_files" not in st.session_state:
-        st.session_state["job_processed_files"] = 0
-    if "job_current_file" not in st.session_state:
-        st.session_state["job_current_file"] = None
-    if "job_results" not in st.session_state:
-        st.session_state["job_results"] = []
-    if "job_exception_queue" not in st.session_state:
-        st.session_state["job_exception_queue"] = []
-    if "job_output_zip" not in st.session_state:
-        st.session_state["job_output_zip"] = None
-    if "job_output_zip_name" not in st.session_state:
-        st.session_state["job_output_zip_name"] = None
-    if "job_assessment_pdf" not in st.session_state:
-        st.session_state["job_assessment_pdf"] = None
-    if "job_rankings" not in st.session_state:
-        st.session_state["job_rankings"] = []
+    job_id = st.session_state.get("active_background_job_id")
+    if not job_id:
+        st.caption("No active background batch job.")
+        return
 
-    job_running = st.session_state.get("job_running", False)
-    job_status = st.session_state.get("job_status", "Idle")
-    job_progress = int(st.session_state.get("job_progress", 0) or 0)
-    job_total_files = int(st.session_state.get("job_total_files", 0) or 0)
-    job_processed_files = int(st.session_state.get("job_processed_files", 0) or 0)
-    job_current_file = st.session_state.get("job_current_file")
-    job_results = st.session_state.get("job_results", []) or []
-    job_exceptions = st.session_state.get("job_exception_queue", []) or []
-    job_zip = st.session_state.get("job_output_zip")
-    job_zip_name = st.session_state.get("job_output_zip_name")
-    job_pdf = st.session_state.get("job_assessment_pdf")
-    job_rankings = st.session_state.get("job_rankings", []) or []
+    job = get_background_job(job_id)
+    if not job:
+        st.caption("No active background batch job.")
+        return
 
-    if job_running:
+    job_status = job.get("status", "Idle")
+    job_progress = int(job.get("progress", 0) or 0)
+    job_total_files = int(job.get("total_files", 0) or 0)
+    job_processed_files = int(job.get("processed_files", 0) or 0)
+    job_current_file = job.get("current_file")
+    job_results = job.get("results", []) or []
+    job_exceptions = job.get("exceptions", []) or []
+    job_zip = job.get("output_zip")
+    job_zip_name = job.get("output_zip_name")
+    job_pdf = job.get("assessment_pdf")
+    job_rankings = job.get("rankings", []) or []
+
+    if str(job_status).startswith(("Queued", "Running", "Processing")):
         st.info("Background batch is running.")
     else:
-        st.caption("No active background batch job.")
+        st.caption("Background batch is not active.")
 
     st.markdown(f"**Status:** {job_status}")
     st.markdown(f"**Processed:** {job_processed_files} / {job_total_files}")
@@ -1491,7 +1518,7 @@ def render_background_job_monitor():
                 file_name=job_zip_name or "background_job_resumes.zip",
                 mime="application/zip",
                 use_container_width=True,
-                key="job_resume_zip_download"
+                key=f"job_resume_zip_download_{job_id}"
             )
 
     with d2:
@@ -1502,7 +1529,7 @@ def render_background_job_monitor():
                 file_name="BackgroundDetailedAssessment.pdf",
                 mime="application/pdf",
                 use_container_width=True,
-                key="job_assessment_pdf_download"
+                key=f"job_assessment_pdf_download_{job_id}"
             )
 
     if job_rankings:
@@ -1517,7 +1544,6 @@ def render_background_job_monitor():
                     "Recommendation": item.get("recommendation"),
                 })
             st.dataframe(pd.DataFrame(ranking_rows), use_container_width=True, hide_index=True)
-
 
 def push_job_notification(message):
     if "job_notifications" not in st.session_state:
