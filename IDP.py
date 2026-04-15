@@ -1243,6 +1243,7 @@ def process_single_file(uploaded_file):
         "agent_timings": deepcopy(st.session_state.get("agent_timings", {})),
     }
 
+
 def process_single_file_for_job(uploaded_file, existing_results=None, template_bytes=None):
     existing_results = existing_results or []
 
@@ -1361,8 +1362,18 @@ def process_single_file_for_job(uploaded_file, existing_results=None, template_b
     after_tokens = st.session_state.get("metrics", {}).get("tokens", 0)
 
     status = "Completed"
+
     if exception_reason:
-        status = "Exception"
+        reason_text = str(exception_reason).lower()
+
+        if doc_type == "resume" and (
+            "validation" in reason_text
+            or "missing" in reason_text
+            or "confidence" in reason_text
+        ):
+            status = "Review Needed"
+        else:
+            status = "Exception"
     elif not validation.get("passed", True):
         status = "Review Needed"
 
