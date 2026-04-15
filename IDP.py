@@ -1609,7 +1609,7 @@ def run_background_batch_job(job_id, uploaded_files, jd_text):
                     existing_results=local_results,
                     template_bytes=template_bytes,
                 )
-                )
+                
                 local_results.append(result)
 
                 if result.get("status") == "Exception":
