@@ -257,14 +257,25 @@ def write_job_json(job_id: str, data: dict):
     path = get_job_meta_path(job_id)
     serializable = deepcopy(data)
 
-    # strip non-serializable source file objects before save
     if "source_files" in serializable:
-        serializable["source_files"] = [
-            {"name": f.name, "content_hex": f.getvalue().hex()}
-            for f in serializable.get("source_files", [])
-        ]
+        normalized_files = []
+        for f in serializable.get("source_files", []):
+            if isinstance(f, dict):
+                normalized_files.append({
+                    "name": f.get("name"),
+                    "content_hex": f.get("content_hex"),
+                })
+            else:
+                normalized_files.append({
+                    "name": f.name,
+                    "content_hex": f.getvalue().hex(),
+                })
+        serializable["source_files"] = normalized_files
 
-    path.write_text(json.dumps(serializable, indent=2, ensure_ascii=False), encoding="utf-8")
+    path.write_text(
+        json.dumps(serializable, indent=2, ensure_ascii=False),
+        encoding="utf-8"
+    )
 
 
 def read_job_json(job_id: str):
@@ -430,12 +441,15 @@ def reset_source_state():
 def restore_source_files_from_job(job):
     files = []
     for item in job.get("source_files", []) or []:
-        files.append(
-            RemoteUploadedFile(
-                name=item["name"],
-                content=bytes.fromhex(item["content_hex"]),
+        if isinstance(item, dict):
+            name = item.get("name")
+            content_hex = item.get("content_hex", "")
+            files.append(
+                RemoteUploadedFile(
+                    name=name,
+                    content=bytes.fromhex(content_hex) if content_hex else b"",
+                )
             )
-        )
     return files
 
 def extract_jd_text_from_upload(uploaded_file):
