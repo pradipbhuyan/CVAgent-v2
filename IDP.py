@@ -369,6 +369,8 @@ def resume_background_batch_job():
 def create_background_job_record(uploaded_files, jd_text):
     job_id = str(uuid.uuid4())
 
+    active_template = get_active_template_bytes()
+
     job = {
         "job_id": job_id,
         "status": "Queued",
@@ -385,6 +387,7 @@ def create_background_job_record(uploaded_files, jd_text):
         "notifications": [],
         "jd_text": jd_text,
         "source_files": uploaded_files,
+        "template_bytes_hex": active_template.hex() if active_template else None,
         "is_running": False,
         "last_error": None,
         "last_update": time.time(),
@@ -1240,7 +1243,7 @@ def process_single_file(uploaded_file):
         "agent_timings": deepcopy(st.session_state.get("agent_timings", {})),
     }
 
-def process_single_file_for_job(uploaded_file, existing_results=None):
+def process_single_file_for_job(uploaded_file, existing_results=None, template_bytes=None):
     existing_results = existing_results or []
 
     extracted = process_file_with_fallback(uploaded_file)
@@ -1269,6 +1272,12 @@ def process_single_file_for_job(uploaded_file, existing_results=None):
             "auto_result": None,
             "vectorstore": None,
             "full_text": None,
+            "debug_info": {
+                "graph_error": None,
+                "detected_doc_type": None,
+                "extraction_mode": extracted.get("extraction_mode"),
+                "text_preview": "",
+            },
         }
 
     vectorstore = create_vectorstore(docs)
@@ -1277,7 +1286,7 @@ def process_single_file_for_job(uploaded_file, existing_results=None):
     graph_input = {
         "text": full_text,
         "filename": uploaded_file.name,
-        "template": get_active_template_bytes(),
+        "template": template_bytes,
         "progress": lambda percent, message: None,
         "event_callback": lambda step, status, message="": None,
         "ocr_used": extracted["ocr_used"],
@@ -1294,6 +1303,8 @@ def process_single_file_for_job(uploaded_file, existing_results=None):
     doc_type = normalized.get("doc_type")
     result = normalized.get("result", {})
     review_data = result.get("data") or normalized.get("structured_data") or {}
+    raw_error = normalized.get("error")
+    extraction_mode = extracted.get("extraction_mode")
 
     if doc_type != "resume":
         return {
@@ -1308,9 +1319,15 @@ def process_single_file_for_job(uploaded_file, existing_results=None):
             "duplicate_info": None,
             "auto_result": None,
             "vectorstore": None,
-            "full_text": None,
+            "full_text": full_text,
             "cost": 0.0,
             "tokens": 0,
+            "debug_info": {
+                "detected_doc_type": doc_type,
+                "graph_error": raw_error,
+                "extraction_mode": extraction_mode,
+                "text_preview": full_text[:1000] if full_text else "",
+            },
         }
 
     validation = normalized.get("validation") or validate_document_data(review_data, doc_type)
@@ -1362,6 +1379,12 @@ def process_single_file_for_job(uploaded_file, existing_results=None):
         "full_text": full_text,
         "cost": round(after_cost - before_cost, 6),
         "tokens": after_tokens - before_tokens,
+        "debug_info": {
+            "detected_doc_type": doc_type,
+            "graph_error": raw_error,
+            "extraction_mode": extraction_mode,
+            "text_preview": full_text[:1000] if full_text else "",
+        },
     }
 
 
@@ -1546,6 +1569,10 @@ def compact_field(label, value):
 
 def run_background_batch_job(job_id, uploaded_files, jd_text):
     try:
+        job = get_background_job(job_id)
+        template_hex = job.get("template_bytes_hex") if job else None
+        template_bytes = bytes.fromhex(template_hex) if template_hex else None
+        
         update_background_job(
             job_id,
             status="Running",
@@ -1580,6 +1607,8 @@ def run_background_batch_job(job_id, uploaded_files, jd_text):
                 result = process_single_file_for_job(
                     uploaded_file,
                     existing_results=local_results,
+                    template_bytes=template_bytes,
+                )
                 )
                 local_results.append(result)
 
@@ -1795,15 +1824,38 @@ def render_background_job_monitor():
 
     if job_results:
         rows = []
+
+        
         for item in job_results:
+            debug_info = item.get("debug_info") or {}
             rows.append({
                 "File": item.get("file_name"),
                 "Type": item.get("doc_type"),
                 "Status": item.get("status"),
                 "OCR": "Yes" if item.get("ocr_used") else "No",
                 "Reason": item.get("exception_reason") or "-",
+                "Detected Type": debug_info.get("detected_doc_type") or "-",
+                "Extraction": debug_info.get("extraction_mode") or "-",
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=220)
+        
+        rejected_items = [x for x in job_results if x.get("status") == "Exception"]
+        if rejected_items:
+            with st.expander("Rejected File Debug", expanded=False):
+                for item in rejected_items:
+                    st.markdown(f"**File:** {item.get('file_name')}")
+                    st.markdown(f"**Reason:** {item.get('exception_reason')}")
+                    debug_info = item.get("debug_info") or {}
+                    st.markdown(f"**Detected Type:** {debug_info.get('detected_doc_type') or '-'}")
+                    st.markdown(f"**Extraction Mode:** {debug_info.get('extraction_mode') or '-'}")
+                    preview = debug_info.get("text_preview") or ""
+                    if preview:
+                        st.text_area(
+                            f"Preview - {item.get('file_name')}",
+                            value=preview,
+                            height=180,
+                            key=f"debug_preview_{job_id}_{item.get('file_name')}"
+                        )
 
     if job_exceptions:
         st.warning(f"{len(job_exceptions)} file(s) ended in exception.")
