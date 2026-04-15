@@ -1275,6 +1275,8 @@ def process_single_file_for_job(uploaded_file, existing_results=None, template_b
             "debug_info": {
                 "graph_error": None,
                 "detected_doc_type": None,
+                "final_doc_type": "unknown",
+                "resume_fallback_used": False,
                 "extraction_mode": extracted.get("extraction_mode"),
                 "text_preview": "",
             },
@@ -1300,11 +1302,17 @@ def process_single_file_for_job(uploaded_file, existing_results=None, template_b
     raw_result = graph.invoke(graph_input)
     normalized = normalize_graph_result(raw_result)
 
-    doc_type = normalized.get("doc_type")
+    original_doc_type = normalized.get("doc_type")
+    doc_type = original_doc_type
     result = normalized.get("result", {})
     review_data = result.get("data") or normalized.get("structured_data") or {}
     raw_error = normalized.get("error")
     extraction_mode = extracted.get("extraction_mode")
+
+    resume_fallback_used = False
+    if doc_type != "resume" and looks_like_resume_text(full_text):
+        doc_type = "resume"
+        resume_fallback_used = True
 
     if doc_type != "resume":
         return {
@@ -1312,7 +1320,7 @@ def process_single_file_for_job(uploaded_file, existing_results=None, template_b
             "status": "Exception",
             "doc_type": doc_type or "unknown",
             "ocr_used": extracted["ocr_used"],
-            "exception_reason": f"Not a CV/Resume (detected: {doc_type or 'unknown'})",
+            "exception_reason": f"Not a CV/Resume (detected: {original_doc_type or 'unknown'})",
             "review_data": None,
             "validation": None,
             "confidence": None,
@@ -1323,8 +1331,10 @@ def process_single_file_for_job(uploaded_file, existing_results=None, template_b
             "cost": 0.0,
             "tokens": 0,
             "debug_info": {
-                "detected_doc_type": doc_type,
+                "detected_doc_type": original_doc_type,
+                "final_doc_type": doc_type,
                 "graph_error": raw_error,
+                "resume_fallback_used": resume_fallback_used,
                 "extraction_mode": extraction_mode,
                 "text_preview": full_text[:1000] if full_text else "",
             },
@@ -1380,13 +1390,59 @@ def process_single_file_for_job(uploaded_file, existing_results=None, template_b
         "cost": round(after_cost - before_cost, 6),
         "tokens": after_tokens - before_tokens,
         "debug_info": {
-            "detected_doc_type": doc_type,
+            "detected_doc_type": original_doc_type,
+            "final_doc_type": doc_type,
             "graph_error": raw_error,
+            "resume_fallback_used": resume_fallback_used,
             "extraction_mode": extraction_mode,
             "text_preview": full_text[:1000] if full_text else "",
         },
     }
 
+
+def looks_like_resume_text(text: str) -> bool:
+    if not text:
+        return False
+
+    t = text.lower()
+    signals = 0
+
+    if "@" in t or "email" in t or "email id" in t:
+        signals += 1
+    if "mobile" in t or "phone" in t or "contact" in t:
+        signals += 1
+    if "location" in t or "address" in t:
+        signals += 1
+
+    resume_keywords = [
+        "experience",
+        "work experience",
+        "professional summary",
+        "summary",
+        "skills",
+        "technical skills",
+        "education",
+        "certification",
+        "projects",
+        "employment",
+        "career objective",
+        "profile",
+        "responsibilities",
+    ]
+    for kw in resume_keywords:
+        if kw in t:
+            signals += 1
+
+    if "years of experience" in t or "year of experience" in t:
+        signals += 2
+    if "curriculum vitae" in t or "resume" in t:
+        signals += 2
+
+    bullet_count = text.count("•") + text.count("- ")
+    if bullet_count >= 3:
+        signals += 1
+
+    return signals >= 4
 
 def load_batch_result_into_session(index):
     if index < 0 or index >= len(st.session_state.batch_results):
@@ -1824,8 +1880,6 @@ def render_background_job_monitor():
 
     if job_results:
         rows = []
-
-        
         for item in job_results:
             debug_info = item.get("debug_info") or {}
             rows.append({
@@ -1835,6 +1889,8 @@ def render_background_job_monitor():
                 "OCR": "Yes" if item.get("ocr_used") else "No",
                 "Reason": item.get("exception_reason") or "-",
                 "Detected Type": debug_info.get("detected_doc_type") or "-",
+                "Final Type": debug_info.get("final_doc_type") or item.get("doc_type") or "-",
+                "Fallback": "Yes" if debug_info.get("resume_fallback_used") else "No",
                 "Extraction": debug_info.get("extraction_mode") or "-",
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=220)
