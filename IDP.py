@@ -1634,12 +1634,9 @@ def compact_field(label, value):
     )
 
 
+
 def run_background_batch_job(job_id, uploaded_files, jd_text):
     try:
-        job = get_background_job(job_id)
-        template_hex = job.get("template_bytes_hex") if job else None
-        template_bytes = bytes.fromhex(template_hex) if template_hex else None
-        
         update_background_job(
             job_id,
             status="Running",
@@ -1664,19 +1661,40 @@ def run_background_batch_job(job_id, uploaded_files, jd_text):
             update_background_job(
                 job_id,
                 current_file=uploaded_file.name,
-                status=f"Extracting/processing {uploaded_file.name}",
+                status=f"Processing {uploaded_file.name}",
                 progress=int(((idx - 1) / max(total_files, 1)) * 100),
                 results=local_results,
                 exceptions=local_exceptions,
             )
 
+            saved_state = {
+                "current_file": st.session_state.get("current_file"),
+                "batch_results": deepcopy(st.session_state.get("batch_results", [])),
+                "exception_queue": deepcopy(st.session_state.get("exception_queue", [])),
+                "review_data": deepcopy(st.session_state.get("review_data")),
+                "confidence_map": deepcopy(st.session_state.get("confidence_map")),
+                "validation_result": deepcopy(st.session_state.get("validation_result")),
+                "duplicate_info": deepcopy(st.session_state.get("duplicate_info")),
+                "vectorstore": st.session_state.get("vectorstore"),
+                "chat_history": deepcopy(st.session_state.get("chat_history", [])),
+                "suggested_questions": deepcopy(st.session_state.get("suggested_questions", [])),
+                "doc_type": st.session_state.get("doc_type"),
+                "full_text": st.session_state.get("full_text"),
+                "auto_result": deepcopy(st.session_state.get("auto_result")),
+                "generated_resume": st.session_state.get("generated_resume"),
+                "agent_events": deepcopy(st.session_state.get("agent_events", [])),
+                "agent_logs": deepcopy(st.session_state.get("agent_logs", [])),
+                "agent_timings": deepcopy(st.session_state.get("agent_timings", {})),
+                "active_agent": st.session_state.get("active_agent"),
+                "current_step": st.session_state.get("current_step", "Waiting"),
+                "progress_value": st.session_state.get("progress_value", 0),
+            }
+
             try:
-                result = process_single_file_for_job(
-                    uploaded_file,
-                    existing_results=local_results,
-                    template_bytes=template_bytes,
-                )
-                
+                st.session_state["batch_results"] = local_results
+                st.session_state["exception_queue"] = local_exceptions
+
+                result = process_single_file(uploaded_file)
                 local_results.append(result)
 
                 if result.get("status") == "Exception":
@@ -1722,6 +1740,10 @@ def run_background_batch_job(job_id, uploaded_files, jd_text):
                     last_error=str(e),
                 )
 
+            finally:
+                for k, v in saved_state.items():
+                    st.session_state[k] = v
+
             update_background_job(
                 job_id,
                 processed_files=idx,
@@ -1745,9 +1767,15 @@ def run_background_batch_job(job_id, uploaded_files, jd_text):
         resume_zip = build_zip_from_results(local_results, "resume")
         zip_path = save_job_binary(job_id, "background_job_resumes.zip", resume_zip)
 
-        final_status = "Completed"
-        if local_exceptions:
+        review_needed_count = len([x for x in local_results if x.get("status") == "Review Needed"])
+        exception_count = len([x for x in local_results if x.get("status") == "Exception"])
+
+        if exception_count > 0:
             final_status = "Completed with Exceptions"
+        elif review_needed_count > 0:
+            final_status = "Completed with Review Needed"
+        else:
+            final_status = "Completed"
 
         update_background_job(
             job_id,
@@ -1780,6 +1808,7 @@ def run_background_batch_job(job_id, uploaded_files, jd_text):
             job_id,
             f"Background batch failed: {str(e)}"
         )
+
 
 def submit_background_batch_job(uploaded_files):
     jd_text = (st.session_state.get("jd_text") or "").strip()
@@ -1856,6 +1885,18 @@ def render_background_job_monitor():
     last_error = job.get("last_error")
     last_update = job.get("last_update")
     resumable = can_resume_background_job(job)
+
+    completed_count = len([x for x in job_results if x.get("status") == "Completed"])
+    review_count = len([x for x in job_results if x.get("status") == "Review Needed"])
+    exception_count = len([x for x in job_results if x.get("status") == "Exception"])
+
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.metric("Completed", completed_count)
+    with m2:
+        st.metric("Review Needed", review_count)
+    with m3:
+        st.metric("Exceptions", exception_count)
 
     c1, c2 = st.columns(2)
 
