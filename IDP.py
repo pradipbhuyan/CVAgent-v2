@@ -2018,21 +2018,21 @@ def render_background_job_monitor():
 
     
         if job_results:
-        rows = []
-        for item in job_results:
-            debug_info = item.get("debug_info") or {}
-            rows.append({
-                "File": item.get("file_name"),
-                "Type": item.get("doc_type"),
-                "Status": item.get("status"),
-                "OCR": "Yes" if item.get("ocr_used") else "No",
-                "Reason": item.get("exception_reason") or "-",
-                "Detected Type": debug_info.get("detected_doc_type") or item.get("doc_type") or "-",
-                "Final Type": debug_info.get("final_doc_type") or item.get("doc_type") or "-",
-                "Fallback": "Yes" if debug_info.get("resume_fallback_used") else "No",
-                "Extraction": debug_info.get("extraction_mode") or ((item.get("auto_result") or {}).get("extraction_mode")) or "-",
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=220)
+            rows = []
+            for item in job_results:
+                debug_info = item.get("debug_info") or {}
+                rows.append({
+                    "File": item.get("file_name"),
+                    "Type": item.get("doc_type"),
+                    "Status": item.get("status"),
+                    "OCR": "Yes" if item.get("ocr_used") else "No",
+                    "Reason": item.get("exception_reason") or "-",
+                    "Detected Type": debug_info.get("detected_doc_type") or item.get("doc_type") or "-",
+                    "Final Type": debug_info.get("final_doc_type") or item.get("doc_type") or "-",
+                    "Fallback": "Yes" if debug_info.get("resume_fallback_used") else "No",
+                    "Extraction": debug_info.get("extraction_mode") or ((item.get("auto_result") or {}).get("extraction_mode")) or "-",
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=220)
 
 
         
