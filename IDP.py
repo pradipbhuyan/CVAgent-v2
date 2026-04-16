@@ -242,6 +242,37 @@ def get_job_runtime_dir():
     base.mkdir(parents=True, exist_ok=True)
     return base
 
+def ensure_background_processing_session_keys():
+    if "metrics" not in st.session_state:
+        st.session_state["metrics"] = {
+            "tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cost": 0.0,
+            "response_times": [],
+            "calls": 0
+        }
+
+    if "doc_costs" not in st.session_state:
+        st.session_state["doc_costs"] = {}
+
+    if "agent_events" not in st.session_state:
+        st.session_state["agent_events"] = []
+
+    if "agent_logs" not in st.session_state:
+        st.session_state["agent_logs"] = []
+
+    if "agent_timings" not in st.session_state:
+        st.session_state["agent_timings"] = {}
+
+    if "active_agent" not in st.session_state:
+        st.session_state["active_agent"] = None
+
+    if "current_step" not in st.session_state:
+        st.session_state["current_step"] = "Waiting"
+
+    if "progress_value" not in st.session_state:
+        st.session_state["progress_value"] = 0
 
 def get_job_dir(job_id: str):
     job_dir = get_job_runtime_dir() / job_id
@@ -1690,23 +1721,47 @@ def run_background_batch_job(job_id, uploaded_files, jd_text):
                 "progress_value": st.session_state.get("progress_value", 0),
             }
 
+            
             try:
+                if "metrics" not in st.session_state:
+                    st.session_state["metrics"] = {
+                        "tokens": 0,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cost": 0.0,
+                        "response_times": [],
+                        "calls": 0
+                    }
+
+                if "doc_costs" not in st.session_state:
+                    st.session_state["doc_costs"] = {}
+
+                if "agent_events" not in st.session_state:
+                    st.session_state["agent_events"] = []
+
+                if "agent_logs" not in st.session_state:
+                    st.session_state["agent_logs"] = []
+
+                if "agent_timings" not in st.session_state:
+                    st.session_state["agent_timings"] = {}
+
+                if "active_agent" not in st.session_state:
+                    st.session_state["active_agent"] = None
+
+                if "current_step" not in st.session_state:
+                    st.session_state["current_step"] = "Waiting"
+
+                if "progress_value" not in st.session_state:
+                    st.session_state["progress_value"] = 0
+
+                ensure_background_processing_session_keys()
+                
                 st.session_state["batch_results"] = local_results
                 st.session_state["exception_queue"] = local_exceptions
 
                 result = process_single_file(uploaded_file)
                 local_results.append(result)
-
-                if result.get("status") == "Exception":
-                    local_exceptions.append(result)
-
-                update_background_job(
-                    job_id,
-                    status=f"Finished {uploaded_file.name}",
-                    results=local_results,
-                    exceptions=local_exceptions,
-                )
-
+            
             except Exception as e:
                 error_result = {
                     "file_name": uploaded_file.name,
