@@ -1759,8 +1759,39 @@ def run_background_batch_job(job_id, uploaded_files, jd_text):
                 st.session_state["batch_results"] = local_results
                 st.session_state["exception_queue"] = local_exceptions
 
+
                 result = process_single_file(uploaded_file)
+
+                retry_reason = str(result.get("exception_reason") or "").lower()
+                should_retry_with_resume_fallback = (
+                    result.get("status") == "Exception"
+                    and "not a cv/resume" in retry_reason
+                    and "other" in retry_reason
+                )
+                
+                if should_retry_with_resume_fallback:
+                    try:
+                        job = get_background_job(job_id)
+                        template_hex = job.get("template_bytes_hex") if job else None
+                        template_bytes = bytes.fromhex(template_hex) if template_hex else None
+                
+                        fallback_result = process_single_file_for_job(
+                            uploaded_file,
+                            existing_results=local_results,
+                            template_bytes=template_bytes,
+                        )
+                
+                        # Use fallback result only if it rescued the file into resume flow
+                        if fallback_result.get("doc_type") == "resume":
+                            result = fallback_result
+                
+                    except Exception:
+                        pass
+                
                 local_results.append(result)
+        
+                if result.get("status") == "Exception":
+                    local_exceptions.append(result)
             
             except Exception as e:
                 error_result = {
@@ -1989,6 +2020,13 @@ def render_background_job_monitor():
         rows = []
         for item in job_results:
             debug_info = item.get("debug_info") or {}
+            
+            detected_type = debug_info.get("detected_doc_type") or item.get("doc_type") or "-"
+            extraction_mode = debug_info.get("extraction_mode") or ((item.get("auto_result") or {}).get("extraction_mode")) or "-"
+
+            st.markdown(f"**Detected Type:** {detected_type}")
+            st.markdown(f"**Extraction Mode:** {extraction_mode}")
+            
             rows.append({
                 "File": item.get("file_name"),
                 "Type": item.get("doc_type"),
